@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: sms-monitoring-bot
+    env: python
+    region: ohio
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.1

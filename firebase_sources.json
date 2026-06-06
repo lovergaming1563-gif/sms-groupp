@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Firebase-1",
+    "type": "per_device",
+    "base_url": "https://lodaroll-default-rtdb.firebaseio.com/messages"
+  },
+  {
+    "name": "Firebase-2",
+    "type": "global",
+    "url": "https://another-default-rtdb.firebaseio.com/messages.json"
+  }
+]
