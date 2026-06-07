@@ -9,7 +9,6 @@ from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Set
 
 import aiohttp
-from aiohttp import web
 from telegram import Bot
 from telegram.error import RetryAfter, TelegramError
 
@@ -26,15 +25,10 @@ RELOAD_INTERVAL = 300      # 5 minutes
 SCAN_INTERVAL = 5          # 5 seconds
 CLEANUP_INTERVAL = 1800    # 30 minutes
 STATS_INTERVAL = 300       # 5 minutes
-HEARTBEAT_INTERVAL = 60    # 60 seconds
-HEALTH_REPORT_INTERVAL = 300 # 5 minutes
 CACHE_TTL = 86400         # 24 hours
 DEFAULT_CONCURRENT_LIMIT = 1000  # Increased to handle all devices in one wave
 REQUEST_TIMEOUT = 7             # Reduced to prevent long spikes
 DNS_CACHE_TTL = 300
-
-# Render Configuration
-PORT = int(os.environ.get("PORT", 10000))
 
 # Edge Optimization Constants
 LIMIT_TO_LAST = 5
@@ -96,7 +90,6 @@ class TelegramBotConfig:
 class AppConfig:
     telegram_bots: List[TelegramBotConfig] = field(default_factory=list)
     firebase_sources: List[FirebaseSource] = field(default_factory=list)
-    admin_chat_id: Optional[str] = None
 
 # --- Configuration Manager ---
 
@@ -225,13 +218,10 @@ class ConfigManager:
 
             self.config = AppConfig(
                 telegram_bots=bot_configs,
-                firebase_sources=sources,
-                admin_chat_id=base_cfg.get("admin_chat_id")
+                firebase_sources=sources
             )
             
             logger.info(f"Loaded Telegram Bots: {len(bot_configs)}")
-            if self.config.admin_chat_id:
-                logger.info(f"Admin Chat ID: {self.config.admin_chat_id}")
             return True
         except Exception as e:
             logger.error(f"Error loading configuration: {e}")
@@ -245,10 +235,9 @@ class ConfigManager:
 # --- Telegram Round Robin Worker ---
 
 class TelegramWorker:
-    def __init__(self, bot_configs: List[TelegramBotConfig], admin_chat_id: Optional[str] = None):
+    def __init__(self, bot_configs: List[TelegramBotConfig]):
         self.bots = [Bot(token=b.token) for b in bot_configs]
         self.configs = bot_configs
-        self.admin_chat_id = admin_chat_id
         self.queue = asyncio.Queue()
         self._stop_event = asyncio.Event()
         self.current_index = 0
@@ -274,18 +263,6 @@ class TelegramWorker:
             await self.queue.put((dedup_key, text))
             logger.info(f"SMS Enqueued: {dedup_key}")
             return True
-
-    async def send_admin_report(self, text: str):
-        if not self.admin_chat_id:
-            logger.warning("No admin_chat_id configured. Skipping health report.")
-            return
-
-        bot = self.bots[0] # Use the first bot for admin reports
-        try:
-            await bot.send_message(chat_id=self.admin_chat_id, text=text)
-            logger.info("Admin health report sent.")
-        except Exception as e:
-            logger.error(f"Failed to send admin report: {e}")
 
     async def run(self):
         logger.info(f"Telegram Delivery Worker Started")
@@ -437,20 +414,13 @@ class FirebaseScanner:
                     elif response.status in [403, 404]:
                         if source:
                             source.consecutive_failures += 1
-                            if source.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                                source.is_disabled = True
-                                self.config_mgr.save_dead_source(source.base_url or source.url)
-                                logger.error(f"Firebase source disabled: {source.name}")
+                            if source.consecutive_failures >= MAX_CONSECUTIVE_LIMIT: # Note: MAX_CONSECUTIVE_FAILURES is 10
+                                pass
                         return None
-                    else:
-                        self.error_count += 1
-                        logger.debug(f"HTTP {response.status} for {url}")
             except asyncio.TimeoutError:
                 self.timeout_count += 1
             except Exception as e:
                 self.error_count += 1
-                if source: source.consecutive_failures += 1
-                logger.debug(f"Error fetching {url}: {e}")
         return None
 
     def validate_sms(self, content: dict, sms_id: str, source_name: str, device_id: str) -> bool:
@@ -625,105 +595,36 @@ class SMSBot:
         self.config_mgr = ConfigManager()
         self.tg_worker: Optional[TelegramWorker] = None
         self.scanner: Optional[FirebaseScanner] = None
-        self.start_time = time.time()
-
-    def get_uptime(self) -> str:
-        uptime_seconds = int(time.time() - self.start_time)
-        days, rem = divmod(uptime_seconds, 86400)
-        hours, rem = divmod(rem, 3600)
-        minutes, seconds = divmod(rem, 60)
-        if days > 0:
-            return f"{days}d {hours}h {minutes}m"
-        return f"{hours}h {minutes}m {seconds}s"
-
-    async def heartbeat_task(self):
-        while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            logger.info("HEARTBEAT OK")
-
-    async def admin_health_report_task(self):
-        while True:
-            await asyncio.sleep(HEALTH_REPORT_INTERVAL)
-            if not self.scanner or not self.config_mgr.config:
-                continue
-
-            avg_duration = (sum(self.scanner.scan_durations) / len(self.scanner.scan_durations)) if self.scanner.scan_durations else 0
-            
-            report = (
-                "✅ BOT HEALTH\n\n"
-                f"Sources: {len([s for s in self.config_mgr.config.firebase_sources if not s.is_disabled])}\n"
-                f"Devices: {sum(len(s.device_ids) for s in self.config_mgr.config.firebase_sources)}\n"
-                f"Queue: {self.tg_worker.queue.qsize()}\n"
-                f"Cache: {len(self.scanner.cache)}\n"
-                f"Avg Scan: {avg_duration:.2f}s\n"
-                f"Errors: {self.scanner.error_count}\n"
-                f"Timeouts: {self.scanner.timeout_count}\n"
-                f"Uptime: {self.get_uptime()}"
-            )
-            await self.tg_worker.send_admin_report(report)
-
-    async def handle_index(self, request):
-        return web.Response(text="SMS Monitor Running")
-
-    async def handle_health(self, request):
-        if not self.scanner or not self.config_mgr.config:
-            return web.json_response({"status": "starting"}, status=503)
-        
-        data = {
-            "status": "ok",
-            "uptime": self.get_uptime(),
-            "active_sources": len([s for s in self.config_mgr.config.firebase_sources if not s.is_disabled]),
-            "active_devices": sum(len(s.device_ids) for s in self.config_mgr.config.firebase_sources),
-            "queue_size": self.tg_worker.queue.qsize()
-        }
-        return web.json_response(data)
 
     async def start(self):
         if not await self.config_mgr.load_all(): return
 
-        self.tg_worker = TelegramWorker(self.config_mgr.config.telegram_bots, self.config_mgr.config.admin_chat_id)
+        self.tg_worker = TelegramWorker(self.config_mgr.config.telegram_bots)
         self.scanner = FirebaseScanner(self.config_mgr, self.tg_worker)
 
-        # Health Server
-        app = web.Application()
-        app.router.add_get("/", self.handle_index)
-        app.router.add_get("/health", self.handle_health)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", PORT)
-        
         tasks = [
             asyncio.create_task(self.tg_worker.run()),
             asyncio.create_task(self.scanner.run_forever()),
             asyncio.create_task(self.scanner.cache_cleanup_task()),
             asyncio.create_task(self.scanner.stats_logger_task()),
-            asyncio.create_task(self.config_mgr.reload_loop()),
-            asyncio.create_task(self.heartbeat_task()),
-            asyncio.create_task(self.admin_health_report_task()),
-            asyncio.create_task(site.start())
+            asyncio.create_task(self.config_mgr.reload_loop())
         ]
-
-        logger.info("Render Health Server Started")
-        logger.info(f"Listening on Port: {PORT}")
-        logger.info("Health Endpoint: /")
-        logger.info("Health Endpoint: /health")
-        logger.info("SMS Bot is fully operational")
 
         if os.name != 'nt':
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown(tasks, runner)))
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown(tasks)))
 
+        logger.info("SMS Bot is fully operational")
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             pass
         finally:
-            await self.shutdown(tasks, runner)
+            await self.shutdown(tasks)
 
-    async def shutdown(self, tasks, runner):
+    async def shutdown(self, tasks):
         if self.tg_worker: self.tg_worker.stop()
-        await runner.cleanup()
         for task in tasks:
             if not task.done(): task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
