@@ -14,9 +14,9 @@ from telegram.error import RetryAfter, TelegramError
 
 # --- Constants ---
 CONFIG_FILE = "config.json"
-DEVICE_IDS_FILE = "device_ids.txt"
+DEVICE_IDS_FILE = "device_ids.txt"  # Deprecated
 FIREBASE_SOURCES_FILE = "firebase_sources.json"
-DEAD_DEVICES_FILE = "dead_devices.txt"
+DEAD_DEVICES_DIR = "dead_devices"
 DEAD_SOURCES_FILE = "dead_sources.txt"
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "bot.log")
@@ -26,8 +26,8 @@ SCAN_INTERVAL = 5          # 5 seconds
 CLEANUP_INTERVAL = 1800    # 30 minutes
 STATS_INTERVAL = 300       # 5 minutes
 CACHE_TTL = 86400         # 24 hours
-DEFAULT_CONCURRENT_LIMIT = 200
-REQUEST_TIMEOUT = 10       
+DEFAULT_CONCURRENT_LIMIT = 1000  # Increased to handle all devices in one wave
+REQUEST_TIMEOUT = 7             # Reduced to prevent long spikes
 DNS_CACHE_TTL = 300
 
 # Edge Optimization Constants
@@ -73,6 +73,8 @@ class FirebaseSource:
     type: str  # "per_device" or "global"
     base_url: Optional[str] = None
     url: Optional[str] = None
+    device_file: Optional[str] = None
+    device_ids: List[str] = field(default_factory=list)
     consecutive_failures: int = 0
     is_disabled: bool = False
 
@@ -87,7 +89,6 @@ class TelegramBotConfig:
 @dataclass
 class AppConfig:
     telegram_bots: List[TelegramBotConfig] = field(default_factory=list)
-    device_ids: List[str] = field(default_factory=list)
     firebase_sources: List[FirebaseSource] = field(default_factory=list)
 
 # --- Configuration Manager ---
@@ -95,24 +96,41 @@ class AppConfig:
 class ConfigManager:
     def __init__(self):
         self.config: Optional[AppConfig] = None
-        self.dead_devices: Set[str] = set()
+        self.dead_devices: Dict[str, Set[str]] = {}  # Source Name -> Set of Device IDs
         self.dead_sources: Set[str] = set()
 
     def load_dead_entities(self):
-        if os.path.exists(DEAD_DEVICES_FILE):
-            with open(DEAD_DEVICES_FILE, "r") as f:
-                self.dead_devices = {line.strip() for line in f if line.strip()}
+        if not os.path.exists(DEAD_DEVICES_DIR):
+            os.makedirs(DEAD_DEVICES_DIR)
+        
+        # Load source-specific dead devices
+        for filename in os.listdir(DEAD_DEVICES_DIR):
+            if filename.endswith(".txt"):
+                source_name = filename[:-4]
+                filepath = os.path.join(DEAD_DEVICES_DIR, filename)
+                with open(filepath, "r") as f:
+                    self.dead_devices[source_name] = {line.strip() for line in f if line.strip()}
+
         if os.path.exists(DEAD_SOURCES_FILE):
             with open(DEAD_SOURCES_FILE, "r") as f:
                 self.dead_sources = {line.strip() for line in f if line.strip()}
 
-    def save_dead_device(self, device_id: str):
-        self.dead_devices.add(device_id)
-        try:
-            with open(DEAD_DEVICES_FILE, "a") as f:
-                f.write(f"{device_id}\n")
-        except Exception as e:
-            logger.error(f"Failed to write to {DEAD_DEVICES_FILE}: {e}")
+    def is_device_dead(self, source_name: str, device_id: str) -> bool:
+        return device_id in self.dead_devices.get(source_name, set())
+
+    def save_dead_device(self, source_name: str, device_id: str):
+        if source_name not in self.dead_devices:
+            self.dead_devices[source_name] = set()
+        
+        if device_id not in self.dead_devices[source_name]:
+            self.dead_devices[source_name].add(device_id)
+            try:
+                filepath = os.path.join(DEAD_DEVICES_DIR, f"{source_name}.txt")
+                with open(filepath, "a") as f:
+                    f.write(f"{device_id}\n")
+                logger.warning(f"Device {device_id} marked dead on Source {source_name}")
+            except Exception as e:
+                logger.error(f"Failed to write to dead device file for {source_name}: {e}")
 
     def save_dead_source(self, source_url: str):
         self.dead_sources.add(source_url)
@@ -123,11 +141,15 @@ class ConfigManager:
             logger.error(f"Failed to write to {DEAD_SOURCES_FILE}: {e}")
 
     def validate_files_exist(self):
-        required_files = [CONFIG_FILE, DEVICE_IDS_FILE, FIREBASE_SOURCES_FILE]
+        required_files = [CONFIG_FILE, FIREBASE_SOURCES_FILE]
         for f in required_files:
             if not os.path.exists(f):
                 logger.critical(f"Configuration file missing: {f}")
                 return False
+        
+        if os.path.exists(DEVICE_IDS_FILE):
+            logger.warning(f"DEPRECATED: Global '{DEVICE_IDS_FILE}' found. Please use source-specific device files.")
+            
         return True
 
     async def load_all(self) -> bool:
@@ -153,23 +175,49 @@ class ConfigManager:
                 logger.critical("No valid Telegram bots found.")
                 return False
 
-            with open(DEVICE_IDS_FILE, "r") as f:
-                device_ids = [line.strip() for line in f if line.strip() and line.strip() not in self.dead_devices]
-            
             with open(FIREBASE_SOURCES_FILE, "r") as f:
                 fb_data = json.load(f)
                 sources = []
-                for src in fb_data:
-                    if not src.get("name") or not src.get("type"):
+                for src_entry in fb_data:
+                    if not src_entry.get("name") or not src_entry.get("type"):
                         continue
-                    url_key = src.get("base_url") or src.get("url")
+                    
+                    url_key = src_entry.get("base_url") or src_entry.get("url")
                     if url_key in self.dead_sources:
                         continue
-                    sources.append(FirebaseSource(**src))
+
+                    # Create source object
+                    source = FirebaseSource(
+                        name=src_entry["name"],
+                        type=src_entry["type"],
+                        base_url=src_entry.get("base_url"),
+                        url=src_entry.get("url"),
+                        device_file=src_entry.get("device_file")
+                    )
+
+                    # Load IDs if per-device
+                    if source.type == "per_device":
+                        if not source.device_file:
+                            logger.error(f"Source {source.name} is 'per_device' but has no 'device_file' defined.")
+                        elif not os.path.exists(source.device_file):
+                            logger.warning(f"Source: {source.name} | Device File: {source.device_file} | MISSING")
+                        else:
+                            with open(source.device_file, "r") as df:
+                                # Use dict.fromkeys to preserve order while removing duplicates
+                                raw_ids = [line.strip() for line in df if line.strip()]
+                                unique_ids = list(dict.fromkeys(raw_ids))
+                                
+                                # Filter out dead devices for this source
+                                source.device_ids = [did for did in unique_ids if not self.is_device_dead(source.name, did)]
+                                
+                                logger.info(f"Source: {source.name} | Device File: {source.device_file} | Loaded IDs: {len(source.device_ids)}")
+                                if not source.device_ids:
+                                    logger.warning(f"Source: {source.name} | Device File: {source.device_file} | EMPTY or ALL DEAD")
+                    
+                    sources.append(source)
 
             self.config = AppConfig(
                 telegram_bots=bot_configs,
-                device_ids=device_ids,
                 firebase_sources=sources
             )
             
@@ -295,14 +343,12 @@ class FirebaseScanner:
         self.scan_durations: List[float] = []
         self.response_sizes: List[int] = []
         self.records_counts: List[int] = []
-
-    def tune_concurrency(self):
-        device_count = len(self.config_mgr.config.device_ids)
-        needed_limit = (device_count // (SCAN_INTERVAL - 1)) + 10
-        if needed_limit > self.concurrent_limit:
-            self.concurrent_limit = max(DEFAULT_CONCURRENT_LIMIT, needed_limit)
-            self.semaphore = asyncio.Semaphore(self.concurrent_limit)
-            logger.info(f"Auto-tuned concurrency to {self.concurrent_limit} for {device_count} devices")
+        
+        # Performance Tracking
+        self.slow_endpoints: List[tuple] = []
+        self.timeout_count = 0
+        self.retry_count = 0  
+        self.error_count = 0
 
     async def stats_logger_task(self):
         while True:
@@ -317,13 +363,15 @@ class FirebaseScanner:
                 "\n" + "-"*30 + "\n"
                 "Monitoring Statistics\n"
                 f"Active Firebase Sources: {len([s for s in self.config_mgr.config.firebase_sources if not s.is_disabled])}\n"
-                f"Active Device IDs: {len(self.config_mgr.config.device_ids)}\n"
+                f"Active Device IDs (Total): {sum(len(s.device_ids) for s in self.config_mgr.config.firebase_sources)}\n"
                 f"Queue Size: {self.tg_worker.queue.qsize()}\n"
                 f"Cache Size: {len(self.cache)}\n"
                 f"Average Response Size: {avg_size:.1f} bytes\n"
                 f"Average Records/Endpoint: {avg_records:.1f}\n"
                 f"Average Scan Duration: {avg_duration:.2f}s\n"
                 f"Concurrent Limit: {self.concurrent_limit}\n"
+                f"Timeouts (Total): {self.timeout_count}\n"
+                f"Errors (Total): {self.error_count}\n"
                 + "-"*30
             )
             logger.info(stats)
@@ -343,43 +391,59 @@ class FirebaseScanner:
                     del self.cache[k]
 
     async def fetch_json(self, session: aiohttp.ClientSession, url: str, source: Optional[FirebaseSource] = None) -> Optional[dict]:
+        start_fetch = time.time()
         async with self.semaphore:
             try:
                 # Add optimization query params
                 optimized_url = f"{url}?{QUERY_PARAMS}" if "?" not in url else f"{url}&{QUERY_PARAMS}"
                 
                 async with session.get(optimized_url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as response:
+                    duration = time.time() - start_fetch
+                    self.slow_endpoints.append((url, duration))
+                    
                     if response.status == 200:
                         if source: source.consecutive_failures = 0
                         text_data = await response.text()
                         self.response_sizes.append(len(text_data))
                         data = json.loads(text_data)
+                        
+                        if source and source.name == "Firebase-2":
+                            logger.info(f"[DEBUG-F2] URL: {optimized_url} | Raw records: {len(data) if isinstance(data, dict) else 0}")
+                        
                         return data if isinstance(data, dict) else None
                     elif response.status in [403, 404]:
                         if source:
                             source.consecutive_failures += 1
-                            if source.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                                source.is_disabled = True
-                                self.config_mgr.save_dead_source(source.base_url or source.url)
-                                logger.error(f"Firebase source disabled: {source.name}")
+                            if source.consecutive_failures >= MAX_CONSECUTIVE_LIMIT: # Note: MAX_CONSECUTIVE_FAILURES is 10
+                                pass
                         return None
-            except asyncio.CancelledError:
-                raise
+            except asyncio.TimeoutError:
+                self.timeout_count += 1
             except Exception as e:
-                if source: source.consecutive_failures += 1
+                self.error_count += 1
         return None
 
     def validate_sms(self, content: dict, sms_id: str, source_name: str, device_id: str) -> bool:
-        if not sms_id or not str(sms_id).strip(): return False
-        if not content.get("sender") or not str(content.get("sender")).strip(): return False
-        if not content.get("message") or not str(content.get("message")).strip(): return False
+        if not sms_id or not str(sms_id).strip(): 
+            if source_name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Missing id field for {sms_id}")
+            return False
+        if not content.get("sender") or not str(content.get("sender")).strip(): 
+            if source_name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Missing sender field for {sms_id}")
+            return False
+        if not content.get("message") or not str(content.get("message")).strip(): 
+            if source_name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Missing message field for {sms_id}")
+            return False
         return True
 
     def parse_sms_data(self, data: dict, source_name: str, device_id: str) -> List[SMS]:
         sms_list = []
         if not data: return sms_list
         for sms_id, content in data.items():
-            if not isinstance(content, dict): continue
+            if not isinstance(content, dict): 
+                if source_name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Invalid parser output (not a dict) for {sms_id}")
+                continue
+            
+            # Firebase-1 Structure (Standard)
             if content.get("type") == "incoming" and self.validate_sms(content, sms_id, source_name, device_id):
                 sms_list.append(SMS(
                     id=str(sms_id),
@@ -390,6 +454,32 @@ class FirebaseScanner:
                     source_name=source_name,
                     device_id=device_id
                 ))
+            
+            # Firebase-2 Structure (Mapping body -> message)
+            elif source_name == "Firebase-2" and content.get("body") and content.get("sender"):
+                body = str(content.get("body"))
+                sender = str(content.get("sender"))
+                timestamp = str(content.get("timestamp", ""))
+                
+                logger.info(f"[DEBUG-F2] Parsed Record: Key={sms_id} | Sender={sender} | Timestamp={timestamp}")
+                
+                new_sms = SMS(
+                    id=str(sms_id),
+                    sender=sender,
+                    message=body,
+                    type="incoming",
+                    date_time=timestamp,
+                    source_name=source_name,
+                    device_id=device_id
+                )
+                sms_list.append(new_sms)
+                logger.info(f"[DEBUG-F2] SMS Accepted: {new_sms.get_dedup_id()}")
+            
+            elif source_name == "Firebase-2":
+                if content.get("type") != "incoming" and not content.get("body"):
+                    logger.info(f"[DEBUG-F2] SKIP_REASON: Missing 'body' and not 'incoming' type for {sms_id}")
+                elif not content.get("sender"):
+                    logger.info(f"[DEBUG-F2] SKIP_REASON: Missing 'sender' for {sms_id}")
         return sms_list
 
     async def process_endpoint(self, session: aiohttp.ClientSession, url: str, source: FirebaseSource, device_id: str):
@@ -400,23 +490,38 @@ class FirebaseScanner:
         
         if not data:
             if device_id != "Global":
-                count = self.device_null_counts.get(device_id, 0) + 1
-                self.device_null_counts[device_id] = count
+                cache_key = f"{source.name}:{device_id}"
+                count = self.device_null_counts.get(cache_key, 0) + 1
+                self.device_null_counts[cache_key] = count
                 if count >= MAX_CONSECUTIVE_NULL:
-                    self.config_mgr.save_dead_device(device_id)
+                    self.config_mgr.save_dead_device(source.name, device_id)
             return
         else:
             if device_id != "Global":
-                self.device_null_counts[device_id] = 0
+                cache_key = f"{source.name}:{device_id}"
+                self.device_null_counts[cache_key] = 0
 
         sms_list = self.parse_sms_data(data, source.name, device_id)
+        
+        if source.name == "Firebase-2":
+            logger.info(f"[DEBUG-F2] {device_id} | Parsed SMS: {len(sms_list)} | Primed: {is_url_already_primed}")
+            if data:
+                latest_key = sorted(data.keys())[-1] if data else "N/A"
+                logger.info(f"[DEBUG-F2] Latest Firebase key: {latest_key}")
+
         self.records_counts.append(len(sms_list))
         
         new_records_count = 0
         async with self.cache_lock:
             for sms in sms_list:
                 dedup_id = sms.get_dedup_id()
-                if dedup_id in self.cache:
+                in_cache = dedup_id in self.cache
+                
+                if source.name == "Firebase-2":
+                    logger.info(f"[DEBUG-F2] SMS: {dedup_id} | In Cache: {in_cache}")
+                
+                if in_cache:
+                    if source.name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Already in cache for {dedup_id}")
                     continue
                 
                 if is_url_already_primed:
@@ -424,34 +529,45 @@ class FirebaseScanner:
                     if success:
                         self.cache[dedup_id] = time.time()
                         new_records_count += 1
+                    elif source.name == "Firebase-2":
+                        logger.info(f"[DEBUG-F2] SKIP_REASON: Duplicate dedup_id in TG Queue for {dedup_id}")
                 else:
+                    if source.name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Priming mode for {dedup_id}")
                     self.cache[dedup_id] = time.time()
         
         if not is_url_already_primed:
             logger.info(f"Primed endpoint: {url} | Cached: {len(sms_list)} records (Latest Only)")
             self.primed_urls.add(url)
         elif new_records_count > 0:
+            if source.name == "Firebase-2":
+                logger.info(f"[DEBUG-F2] Enqueued SMS Count: {new_records_count}")
             logger.info(f"Source {source.name}:{device_id} | SMS Found: {new_records_count}")
 
     async def run_forever(self):
         logger.info("Scanner Started")
         logger.info("Edge Optimization Enabled")
         logger.info(f"Limit To Last: {LIMIT_TO_LAST}")
+        logger.info(f"Fixed Concurrency: {self.concurrent_limit}")
         
-        self.tune_concurrency()
-        
+        # Use a high enough limit for the connector
         connector = aiohttp.TCPConnector(limit=self.concurrent_limit, ttl_dns_cache=DNS_CACHE_TTL)
         async with aiohttp.ClientSession(connector=connector) as session:
             while True:
                 start_time = time.time()
+                self.slow_endpoints = []
+                
                 await self.do_scan(session)
+                
                 duration = time.time() - start_time
                 self.scan_durations.append(duration)
                 
+                # Identify slowest 20 endpoints
+                self.slow_endpoints.sort(key=lambda x: x[1], reverse=True)
+                top_20 = self.slow_endpoints[:20]
+                
                 wait_time = max(0.1, SCAN_INTERVAL - duration)
                 if duration > SCAN_INTERVAL:
-                    logger.warning(f"Scan took {duration:.2f}s. Tuning concurrency...")
-                    self.tune_concurrency()
+                    logger.warning(f"Scan took {duration:.2f}s. Slowest: {[(u.split('/')[-1], f'{d:.2f}s') for u, d in top_20]}")
                 
                 await asyncio.sleep(wait_time)
 
@@ -463,8 +579,9 @@ class FirebaseScanner:
         for src in cfg.firebase_sources:
             if src.is_disabled: continue
             if src.type == "per_device":
-                for dev_id in cfg.device_ids:
-                    if dev_id in self.config_mgr.dead_devices: continue
+                for dev_id in src.device_ids:
+                    # Dead check already done during load, but extra safety
+                    if self.config_mgr.is_device_dead(src.name, dev_id): continue
                     tasks.append(self.process_endpoint(session, f"{src.base_url}/{dev_id}.json", src, dev_id))
             elif src.type == "global":
                 tasks.append(self.process_endpoint(session, src.url, src, "Global"))

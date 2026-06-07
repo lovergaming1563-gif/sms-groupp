@@ -2,11 +2,13 @@
   {
     "name": "Firebase-1",
     "type": "per_device",
-    "base_url": "https://lodaroll-default-rtdb.firebaseio.com/messages"
+    "base_url": "https://lodaroll-default-rtdb.firebaseio.com/messages",
+    "device_file": "firebase1_devices.txt"
   },
   {
     "name": "Firebase-2",
-    "type": "global",
-    "url": "https://another-default-rtdb.firebaseio.com/messages.json"
+    "type": "per_device",
+    "base_url": "https://server-23-d1605-default-rtdb.firebaseio.com/user_sms",
+    "device_file": "firebase2_devices.txt"
   }
 ]
