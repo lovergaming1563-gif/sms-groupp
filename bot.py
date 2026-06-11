@@ -407,14 +407,14 @@ class FirebaseScanner:
                         self.response_sizes.append(len(text_data))
                         data = json.loads(text_data)
                         
-                        if source and source.name == "Firebase-2":
-                            logger.info(f"[DEBUG-F2] URL: {optimized_url} | Raw records: {len(data) if isinstance(data, dict) else 0}")
+                        if source and source.name in ["Firebase-2", "Firebase-3"]:
+                            logger.info(f"[DEBUG-{source.name[-2:]}] URL: {optimized_url} | Raw records: {len(data) if isinstance(data, dict) else 0}")
                         
                         return data if isinstance(data, dict) else None
                     elif response.status in [403, 404]:
                         if source:
                             source.consecutive_failures += 1
-                            if source.consecutive_failures >= MAX_CONSECUTIVE_LIMIT: # Note: MAX_CONSECUTIVE_FAILURES is 10
+                            if source.consecutive_failures >= MAX_CONSECUTIVE_FAILURES: # Note: MAX_CONSECUTIVE_FAILURES is 10
                                 pass
                         return None
             except asyncio.TimeoutError:
@@ -425,13 +425,13 @@ class FirebaseScanner:
 
     def validate_sms(self, content: dict, sms_id: str, source_name: str, device_id: str) -> bool:
         if not sms_id or not str(sms_id).strip(): 
-            if source_name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Missing id field for {sms_id}")
+            if source_name in ["Firebase-2", "Firebase-3"]: logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Missing id field for {sms_id}")
             return False
         if not content.get("sender") or not str(content.get("sender")).strip(): 
-            if source_name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Missing sender field for {sms_id}")
+            if source_name in ["Firebase-2", "Firebase-3"]: logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Missing sender field for {sms_id}")
             return False
         if not content.get("message") or not str(content.get("message")).strip(): 
-            if source_name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Missing message field for {sms_id}")
+            if source_name in ["Firebase-2", "Firebase-3"]: logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Missing message field for {sms_id}")
             return False
         return True
 
@@ -440,7 +440,7 @@ class FirebaseScanner:
         if not data: return sms_list
         for sms_id, content in data.items():
             if not isinstance(content, dict): 
-                if source_name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Invalid parser output (not a dict) for {sms_id}")
+                if source_name in ["Firebase-2", "Firebase-3"]: logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Invalid parser output (not a dict) for {sms_id}")
                 continue
             
             # Firebase-1 Structure (Standard)
@@ -456,12 +456,12 @@ class FirebaseScanner:
                 ))
             
             # Firebase-2 Structure (Mapping body -> message)
-            elif source_name == "Firebase-2" and content.get("body") and content.get("sender"):
+            elif source_name in ["Firebase-2", "Firebase-3"] and content.get("body") and content.get("sender"):
                 body = str(content.get("body"))
                 sender = str(content.get("sender"))
                 timestamp = str(content.get("timestamp", ""))
                 
-                logger.info(f"[DEBUG-F2] Parsed Record: Key={sms_id} | Sender={sender} | Timestamp={timestamp}")
+                logger.info(f"[DEBUG-{source.name[-2:]}] Parsed Record: Key={sms_id} | Sender={sender} | Timestamp={timestamp}")
                 
                 new_sms = SMS(
                     id=str(sms_id),
@@ -473,13 +473,13 @@ class FirebaseScanner:
                     device_id=device_id
                 )
                 sms_list.append(new_sms)
-                logger.info(f"[DEBUG-F2] SMS Accepted: {new_sms.get_dedup_id()}")
+                logger.info(f"[DEBUG-{source.name[-2:]}] SMS Accepted: {new_sms.get_dedup_id()}")
             
-            elif source_name == "Firebase-2":
+            elif source_name in ["Firebase-2", "Firebase-3"]:
                 if content.get("type") != "incoming" and not content.get("body"):
-                    logger.info(f"[DEBUG-F2] SKIP_REASON: Missing 'body' and not 'incoming' type for {sms_id}")
+                    logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Missing 'body' and not 'incoming' type for {sms_id}")
                 elif not content.get("sender"):
-                    logger.info(f"[DEBUG-F2] SKIP_REASON: Missing 'sender' for {sms_id}")
+                    logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Missing 'sender' for {sms_id}")
         return sms_list
 
     async def process_endpoint(self, session: aiohttp.ClientSession, url: str, source: FirebaseSource, device_id: str):
@@ -503,11 +503,11 @@ class FirebaseScanner:
 
         sms_list = self.parse_sms_data(data, source.name, device_id)
         
-        if source.name == "Firebase-2":
-            logger.info(f"[DEBUG-F2] {device_id} | Parsed SMS: {len(sms_list)} | Primed: {is_url_already_primed}")
+        if source.name in ["Firebase-2", "Firebase-3"]:
+            logger.info(f"[DEBUG-{source.name[-2:]}] {device_id} | Parsed SMS: {len(sms_list)} | Primed: {is_url_already_primed}")
             if data:
                 latest_key = sorted(data.keys())[-1] if data else "N/A"
-                logger.info(f"[DEBUG-F2] Latest Firebase key: {latest_key}")
+                logger.info(f"[DEBUG-{source.name[-2:]}] Latest Firebase key: {latest_key}")
 
         self.records_counts.append(len(sms_list))
         
@@ -517,11 +517,11 @@ class FirebaseScanner:
                 dedup_id = sms.get_dedup_id()
                 in_cache = dedup_id in self.cache
                 
-                if source.name == "Firebase-2":
-                    logger.info(f"[DEBUG-F2] SMS: {dedup_id} | In Cache: {in_cache}")
+                if source.name in ["Firebase-2", "Firebase-3"]:
+                    logger.info(f"[DEBUG-{source.name[-2:]}] SMS: {dedup_id} | In Cache: {in_cache}")
                 
                 if in_cache:
-                    if source.name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Already in cache for {dedup_id}")
+                    if source.name in ["Firebase-2", "Firebase-3"]: logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Already in cache for {dedup_id}")
                     continue
                 
                 if is_url_already_primed:
@@ -529,18 +529,18 @@ class FirebaseScanner:
                     if success:
                         self.cache[dedup_id] = time.time()
                         new_records_count += 1
-                    elif source.name == "Firebase-2":
-                        logger.info(f"[DEBUG-F2] SKIP_REASON: Duplicate dedup_id in TG Queue for {dedup_id}")
+                    elif source.name in ["Firebase-2", "Firebase-3"]:
+                        logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Duplicate dedup_id in TG Queue for {dedup_id}")
                 else:
-                    if source.name == "Firebase-2": logger.info(f"[DEBUG-F2] SKIP_REASON: Priming mode for {dedup_id}")
+                    if source.name in ["Firebase-2", "Firebase-3"]: logger.info(f"[DEBUG-{source.name[-2:]}] SKIP_REASON: Priming mode for {dedup_id}")
                     self.cache[dedup_id] = time.time()
         
         if not is_url_already_primed:
             logger.info(f"Primed endpoint: {url} | Cached: {len(sms_list)} records (Latest Only)")
             self.primed_urls.add(url)
         elif new_records_count > 0:
-            if source.name == "Firebase-2":
-                logger.info(f"[DEBUG-F2] Enqueued SMS Count: {new_records_count}")
+            if source.name in ["Firebase-2", "Firebase-3"]:
+                logger.info(f"[DEBUG-{source.name[-2:]}] Enqueued SMS Count: {new_records_count}")
             logger.info(f"Source {source.name}:{device_id} | SMS Found: {new_records_count}")
 
     async def run_forever(self):

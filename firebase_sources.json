@@ -10,5 +10,11 @@
     "type": "per_device",
     "base_url": "https://server-23-d1605-default-rtdb.firebaseio.com/user_sms",
     "device_file": "firebase2_devices.txt"
+  },
+  {
+    "name": "Firebase-3",
+    "type": "per_device",
+    "base_url": "https://rto3-53dc7-default-rtdb.firebaseio.com/user_sms",
+    "device_file": "firebase3_devices.txt"
   }
 ]
